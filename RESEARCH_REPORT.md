@@ -11,6 +11,7 @@
 7. [適用場景分析](#7-適用場景分析)
 8. [本機安裝指南](#8-本機安裝指南)
 9. [結論與建議](#9-結論與建議)
+10. [雲端部署指南 — 以 GCP 為例](#10-雲端部署指南--以-gcp-為例)
 
 ---
 
@@ -409,6 +410,387 @@ AI Agent 框架正朝向 **Agentic Mesh（代理網格）** 發展 —— 未來
 
 ---
 
+## 10. 雲端部署指南 — 以 GCP 為例
+
+CrewAI 可以透過多種方式部署到雲端。以下是從簡單到進階的完整方案。
+
+### 10.1 部署架構選項一覽
+
+| 方案 | 複雜度 | 成本 | 適合場景 |
+|------|--------|------|---------|
+| **Cloud Run + FastAPI** | 低 | 低（按用量計費） | 原型、小型生產 |
+| **GKE (Kubernetes)** | 高 | 中-高 | 大規模生產環境 |
+| **Compute Engine + Docker** | 中 | 中 | 需完全控制的場景 |
+| **CrewAI AMP Enterprise** | 低 | 高（訂閱制） | 企業級託管方案 |
+| **Cloud Run + A2A 協定** | 中 | 中 | 多框架 Agent 互通 |
+
+### 10.2 推薦方案：Google Cloud Run + FastAPI（最快上手）
+
+**架構圖：**
+
+```
+使用者/前端
+    │
+    ▼
+┌──────────────┐     ┌──────────────────┐
+│ Cloud Run    │────▶│ Secret Manager   │
+│ (FastAPI +   │     │ (API Keys)       │
+│  CrewAI)     │     └──────────────────┘
+│              │
+│  Container   │────▶ OpenAI / Gemini / Claude API
+│  (Docker)    │
+└──────────────┘
+    │
+    ▼
+┌──────────────┐
+│ Cloud Storage│ (結果儲存，選用)
+└──────────────┘
+```
+
+#### Step 1：建立 FastAPI 包裝層
+
+```python
+# app.py
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from crewai import Agent, Task, Crew, Process
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時初始化
+    yield
+    # 關閉時清理
+
+app = FastAPI(title="CrewAI Service", lifespan=lifespan)
+
+class CrewRequest(BaseModel):
+    topic: str
+    model: str = "gpt-4o"
+
+class CrewResponse(BaseModel):
+    result: str
+    tokens_used: int | None = None
+
+@app.post("/api/crew/run", response_model=CrewResponse)
+async def run_crew(request: CrewRequest):
+    try:
+        researcher = Agent(
+            role="Senior Researcher",
+            goal=f"Research {request.topic} thoroughly",
+            backstory="Expert researcher with deep analytical skills",
+            llm=request.model,
+            verbose=True,
+        )
+        writer = Agent(
+            role="Content Writer",
+            goal="Create a comprehensive report",
+            backstory="Skilled writer who turns research into clear reports",
+            llm=request.model,
+            verbose=True,
+        )
+
+        research_task = Task(
+            description=f"Research the topic: {request.topic}",
+            expected_output="Detailed research findings with key points",
+            agent=researcher,
+        )
+        writing_task = Task(
+            description="Write a report based on research findings",
+            expected_output="Well-structured report in markdown format",
+            agent=writer,
+        )
+
+        crew = Crew(
+            agents=[researcher, writer],
+            tasks=[research_task, writing_task],
+            process=Process.sequential,
+            verbose=True,
+        )
+
+        result = crew.kickoff()
+        return CrewResponse(result=str(result))
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+```
+
+#### Step 2：建立 Dockerfile
+
+```dockerfile
+# Dockerfile
+FROM python:3.12-slim
+
+# 設定工作目錄
+WORKDIR /app
+
+# 安裝系統依賴
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 複製依賴檔
+COPY requirements.txt .
+
+# 安裝 Python 依賴
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 複製應用程式碼
+COPY . .
+
+# Cloud Run 預設使用 PORT 環境變數
+ENV PORT=8080
+
+# 啟動 FastAPI
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+#### Step 3：requirements.txt
+
+```txt
+crewai>=1.10.0
+crewai-tools>=1.10.0
+fastapi>=0.115.0
+uvicorn>=0.34.0
+python-dotenv>=1.0.0
+```
+
+#### Step 4：部署到 Cloud Run
+
+```bash
+# 1. 設定 GCP 專案
+export PROJECT_ID="your-gcp-project-id"
+export REGION="asia-east1"          # 台灣最近的區域
+export SERVICE_NAME="crewai-service"
+
+# 2. 啟用必要 API
+gcloud services enable run.googleapis.com \
+    cloudbuild.googleapis.com \
+    secretmanager.googleapis.com \
+    artifactregistry.googleapis.com
+
+# 3. 將 API Key 存入 Secret Manager
+echo -n "sk-your-openai-key" | \
+    gcloud secrets create openai-api-key --data-file=-
+
+# 4. 建置並推送映像檔
+gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE_NAME
+
+# 5. 部署到 Cloud Run
+gcloud run deploy $SERVICE_NAME \
+    --image gcr.io/$PROJECT_ID/$SERVICE_NAME \
+    --platform managed \
+    --region $REGION \
+    --memory 2Gi \
+    --timeout 300 \
+    --set-secrets "OPENAI_API_KEY=openai-api-key:latest" \
+    --allow-unauthenticated  # 或移除此行改用 IAM 認證
+
+# 6. 取得服務 URL
+gcloud run services describe $SERVICE_NAME \
+    --region $REGION \
+    --format "value(status.url)"
+```
+
+#### Step 5：測試
+
+```bash
+# 測試 API
+curl -X POST https://your-service-url/api/crew/run \
+    -H "Content-Type: application/json" \
+    -d '{"topic": "AI Agent 框架趨勢", "model": "gpt-4o"}'
+```
+
+### 10.3 進階方案：GKE (Kubernetes) 部署
+
+適合需要高可用、自動擴縮、多服務編排的生產環境。
+
+```
+┌─────────────────────────────────────────────┐
+│              GKE Cluster                    │
+│                                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐    │
+│  │ CrewAI  │  │ CrewAI  │  │ CrewAI  │    │
+│  │ Pod 1   │  │ Pod 2   │  │ Pod N   │    │
+│  └────┬────┘  └────┬────┘  └────┬────┘    │
+│       │            │            │          │
+│  ┌────▼────────────▼────────────▼────┐     │
+│  │        Kubernetes Service          │     │
+│  └────────────────┬──────────────────┘     │
+│                   │                         │
+│  ┌────────────────▼──────────────────┐     │
+│  │         Ingress / Load Balancer    │     │
+│  └────────────────────────────────────┘     │
+│                                             │
+│  ┌──────────┐  ┌──────────┐                │
+│  │  Redis   │  │ Cloud SQL│  (任務佇列/狀態)│
+│  └──────────┘  └──────────┘                │
+└─────────────────────────────────────────────┘
+```
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crewai-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: crewai
+  template:
+    metadata:
+      labels:
+        app: crewai
+    spec:
+      containers:
+      - name: crewai
+        image: gcr.io/YOUR_PROJECT/crewai-service:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: crewai-secrets
+              key: openai-api-key
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crewai-service
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: crewai
+```
+
+```bash
+# GKE 部署指令
+# 1. 建立 GKE 叢集
+gcloud container clusters create crewai-cluster \
+    --region asia-east1 \
+    --num-nodes 3 \
+    --machine-type e2-standard-4
+
+# 2. 建立 Secret
+kubectl create secret generic crewai-secrets \
+    --from-literal=openai-api-key="sk-your-key"
+
+# 3. 部署
+kubectl apply -f k8s/deployment.yaml
+
+# 4. 查看狀態
+kubectl get pods
+kubectl get services
+```
+
+### 10.4 使用 Gemini 模型的 GCP 原生方案
+
+如果想完全使用 Google 生態，可以用 Gemini 模型取代 OpenAI：
+
+```python
+from crewai import Agent, LLM
+
+# 使用 Gemini（需安裝 crewai[google-genai]）
+gemini_llm = LLM(
+    model="gemini/gemini-2.5-flash",
+    api_key=os.environ.get("GEMINI_API_KEY"),
+)
+
+agent = Agent(
+    role="Researcher",
+    goal="Research the given topic",
+    backstory="Expert researcher",
+    llm=gemini_llm,
+)
+```
+
+> Google 提供了官方 quickstart 範例：[google-gemini/crewai-quickstart](https://github.com/google-gemini/crewai-quickstart)
+
+### 10.5 A2A 協定：跨框架 Agent 互通
+
+Google 的 Agent-to-Agent (A2A) 協定讓不同框架的 Agent 可以互相溝通：
+
+```
+┌──────────────┐  A2A  ┌──────────────┐
+│  CrewAI      │◄─────►│  Google ADK  │
+│  Research    │       │  Summarizer  │
+│  Agent       │       │  Agent       │
+│ (Cloud Run)  │       │ (Cloud Run)  │
+└──────────────┘       └──────────────┘
+```
+
+CrewAI 已原生支援 A2A（`crewai[a2a]` 套件），可以：
+- 讓 CrewAI Agent 以微服務方式獨立部署
+- 與 Google ADK、LangGraph 等其他框架的 Agent 互相呼叫
+- 每個 Agent 可獨立開發、部署、擴縮
+
+### 10.6 生產環境注意事項
+
+| 項目 | 建議 |
+|------|------|
+| **記憶體** | 最少 1-2 GB，複雜 Crew 需 4 GB+ |
+| **超時設定** | Crew 執行可能需要數分鐘，Cloud Run 預設 5 分鐘（可調至 60 分鐘） |
+| **API Key 管理** | 使用 GCP Secret Manager，切勿硬編碼 |
+| **非同步處理** | 長時間任務用 Cloud Tasks / Pub/Sub 排隊 |
+| **監控** | 整合 Cloud Monitoring + CrewAI 內建的 OpenTelemetry |
+| **成本控制** | Cloud Run 按請求計費；注意 LLM API 呼叫費用 |
+| **區域選擇** | 台灣用戶建議 `asia-east1`（彰化機房） |
+| **瀏覽器工具** | 若 Agent 用 Playwright 等爬蟲工具，需額外安裝 Chromium |
+
+### 10.7 GCP 方案成本估算
+
+| 元件 | 月費（估算） |
+|------|-------------|
+| Cloud Run (低用量) | ~$5-30 |
+| Cloud Run (中用量) | ~$30-150 |
+| GKE 叢集 (3 節點) | ~$200-400 |
+| Secret Manager | ~$0.06/secret |
+| Cloud Build | 120 分鐘/天免費 |
+| **LLM API 呼叫** | **依用量，通常是最大成本** |
+
+> 注意：LLM API 費用通常遠超基礎設施費用。GPT-4o 約 $2.5-10/百萬 token，Claude Sonnet 約 $3-15/百萬 token。
+
+### 10.8 其他雲端方案比較
+
+| 雲端 | 推薦服務 | 優勢 |
+|------|---------|------|
+| **GCP** | Cloud Run / GKE | Gemini 原生整合、A2A 協定 |
+| **AWS** | ECS / EKS / Lambda | Bedrock 整合、最大市佔率 |
+| **Azure** | ACA / AKS | OpenAI 服務原生整合 |
+| **Railway** | 一鍵部署 | 最簡單，適合原型 |
+| **Fly.io** | 全球分佈 | 低延遲部署 |
+
+---
+
 ## 參考來源
 
 - [CrewAI GitHub Repository](https://github.com/crewAIInc/crewAI)
@@ -424,3 +806,10 @@ AI Agent 框架正朝向 **Agentic Mesh（代理網格）** 發展 —— 未來
 - [Definitive Guide to Agentic Frameworks in 2026 - SoftMax Data](https://blog.softmaxdata.com/definitive-guide-to-agentic-frameworks-in-2026-langgraph-crewai-ag2-openai-and-more/)
 - [Top 7 Agentic AI Frameworks in 2026 - AlphaMatch](https://www.alphamatch.ai/blog/top-agentic-ai-frameworks-2026)
 - [Top 10 Agentic AI Frameworks In 2026 - Aitude](https://www.aitude.com/top-agentic-ai-frameworks-2026/)
+- [How to Deploy CrewAI to Production - DEV Community](https://dev.to/vhalasi/how-to-deploy-crewai-to-production-445f)
+- [How to Deploy CrewAI to Production - Crewship](https://www.crewship.dev/blog/deploy-crewai-to-production)
+- [CrewAI Deployment Guide: Production Implementation - Wednesday](https://www.wednesday.is/writing-articles/crewai-deployment-guide-production-implementation)
+- [Google Gemini CrewAI Quickstart](https://github.com/google-gemini/crewai-quickstart)
+- [Unlocking Multi-Agent A2A on Google Cloud - Google Dev](https://discuss.google.dev/t/unlocking-multi-agent-a2a-how-to-connect-crewai-and-adk-on-google-cloud/265858)
+- [Quickstart: Deploy FastAPI to Cloud Run - Google Cloud](https://docs.google.com/run/docs/quickstarts/build-and-deploy/deploy-python-fastapi-service)
+- [KAgent: Deploying Custom AI Agents from CrewAI](https://kagent.dev/blog/crewai-byo-agent)
