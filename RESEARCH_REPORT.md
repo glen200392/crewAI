@@ -12,6 +12,7 @@
 8. [本機安裝指南](#8-本機安裝指南)
 9. [結論與建議](#9-結論與建議)
 10. [雲端部署指南 — 以 GCP 為例](#10-雲端部署指南--以-gcp-為例)
+11. [開源模型自架方案 — 降低 LLM API 成本](#11-開源模型自架方案--降低-llm-api-成本)
 
 ---
 
@@ -791,6 +792,371 @@ CrewAI 已原生支援 A2A（`crewai[a2a]` 套件），可以：
 
 ---
 
+## 11. 開源模型自架方案 — 降低 LLM API 成本
+
+### 11.1 為什麼要用開源模型？
+
+使用商用 LLM API（OpenAI GPT-4o、Anthropic Claude 等）是 CrewAI 部署的**最大持續成本**。以典型的多 Agent 工作流為例：
+
+| 使用場景 | 每月 API 估算費用 |
+|---------|------------------|
+| 輕度使用（每天 50 次 Crew 執行） | $100-300 |
+| 中度使用（每天 500 次） | $1,000-3,000 |
+| 重度使用（每天 5,000 次） | $10,000+ |
+
+**自架開源模型可將 LLM 成本從「按 token 付費」轉為「固定基礎設施費用」，** 高用量場景下可節省 3-5 倍成本。
+
+### 11.2 CrewAI 原生支援開源模型
+
+CrewAI 透過 **LiteLLM** 整合支援幾乎所有開源模型。原始碼 `lib/crewai/src/crewai/llm.py` 中的 LLM 類別會自動路由：
+
+- **原生 Provider（直連）**：OpenAI、Anthropic、Google、Azure、Bedrock
+- **LiteLLM Fallback（100+ 模型）**：Ollama、vLLM、HuggingFace、LM Studio 等所有 OpenAI 相容 API
+
+使用方式極其簡單：
+
+```python
+from crewai import Agent, LLM
+
+# 方式 1：透過 Ollama 使用本地模型
+agent = Agent(
+    role="Researcher",
+    goal="Research the given topic",
+    backstory="Expert researcher",
+    llm=LLM(
+        model="ollama/llama3.3",
+        base_url="http://localhost:11434"    # Ollama 預設端口
+    ),
+)
+
+# 方式 2：透過 vLLM 使用自架模型
+agent = Agent(
+    role="Analyst",
+    goal="Analyze data",
+    backstory="Data expert",
+    llm=LLM(
+        model="openai/meta-llama/Llama-3.3-70B-Instruct",
+        base_url="http://your-vllm-server:8000/v1",  # vLLM OpenAI 相容 API
+        api_key="token-abc123",                       # vLLM 的 token（任意值即可）
+    ),
+)
+
+# 方式 3：同一 Crew 中混用不同模型
+researcher = Agent(
+    role="Researcher",
+    llm=LLM(model="ollama/llama3.3", base_url="http://localhost:11434"),
+    # ...
+)
+writer = Agent(
+    role="Writer",
+    llm=LLM(model="gpt-4o"),  # 寫作任務用商用模型
+    # ...
+)
+```
+
+### 11.3 推薦開源模型（2026 年）
+
+| 模型 | 參數量 | VRAM 需求 | 最適場景 | 效能等級 |
+|------|--------|-----------|---------|---------|
+| **Llama 3.3 70B** | 70B | 40-80 GB | 通用任務（效能接近 GPT-4o） | 頂級 |
+| **Qwen 2.5 72B** | 72B | 40-80 GB | 多語言（含繁中）、程式碼 | 頂級 |
+| **DeepSeek V3** | 671B MoE | 80+ GB | 推理、數學、程式碼 | 頂級 |
+| **Mistral Small 24B** | 24B | 16 GB | 平衡效能/成本 | 高 |
+| **Llama 3.2 8B** | 8B | 6-8 GB | 簡單任務、低成本 | 中 |
+| **Mistral 7B** | 7B | 6 GB | 基礎任務、預算最低 | 中 |
+| **Gemma 3 27B** | 27B | 18 GB | Google 生態、多模態 | 高 |
+
+> 量化技巧：使用 4-bit 量化（GGUF/AWQ）可將 VRAM 需求降低 50-75%，品質損失極小。例如 Llama 3.3 70B 從 ~140 GB 降至 ~35 GB。
+
+### 11.4 推理引擎比較：Ollama vs vLLM
+
+| 維度 | Ollama | vLLM |
+|------|--------|------|
+| **定位** | 「LLM 界的 Docker」 | 高吞吐量生產推理引擎 |
+| **安裝複雜度** | 極低（一行指令） | 中等 |
+| **吞吐量** | ~41 TPS | ~793 TPS（**19x 差距**） |
+| **並發 128 用戶延遲** | 673ms (P99) | <100ms (P99) |
+| **記憶體效率** | 一般 | PagedAttention 降低 40%+ 碎片 |
+| **API 相容** | OpenAI 相容 | OpenAI 相容 |
+| **適合場景** | 開發/原型/個人 | 生產/多用戶/高並發 |
+| **模型格式** | GGUF（自動量化） | HuggingFace、AWQ、GPTQ |
+
+**決策原則**：開發用 Ollama → 生產用 vLLM。兩者都暴露 OpenAI 相容 API，CrewAI 程式碼只需改 `base_url`。
+
+### 11.5 GCP 部署架構
+
+#### 方案 A：Cloud Run GPU + Ollama（最簡單）
+
+Google Cloud 官方支援在 Cloud Run 上掛載 GPU 跑 Ollama：
+
+```
+┌──────────────────────────────────────────┐
+│            Cloud Run (GPU)               │
+│                                          │
+│  ┌──────────┐     ┌──────────────────┐  │
+│  │ CrewAI   │────▶│ Ollama (Sidecar) │  │
+│  │ FastAPI  │     │ Llama 3.3 / Qwen │  │
+│  │ :8080    │     │ :11434           │  │
+│  └──────────┘     └──────────────────┘  │
+│                          │              │
+│                    ┌─────▼─────┐        │
+│                    │ NVIDIA L4 │        │
+│                    │   GPU     │        │
+│                    └───────────┘        │
+└──────────────────────────────────────────┘
+```
+
+```bash
+# 1. 使用 Google 官方文件的 Ollama + GPU Cloud Run 部署
+# 參考：https://cloud.google.com/run/docs/tutorials/gpu-gemma-with-ollama
+
+# 建立包含 Ollama + 模型的 Docker 映像
+cat > Dockerfile.ollama <<'EOF'
+FROM ollama/ollama:latest
+
+# 預下載模型到映像中（加速冷啟動）
+RUN ollama serve & sleep 5 && ollama pull llama3.3 && killall ollama
+
+EXPOSE 11434
+CMD ["ollama", "serve"]
+EOF
+
+# 建置並部署
+gcloud builds submit --tag gcr.io/$PROJECT_ID/ollama-llama
+gcloud run deploy ollama-service \
+    --image gcr.io/$PROJECT_ID/ollama-llama \
+    --region us-central1 \
+    --gpu 1 \
+    --gpu-type nvidia-l4 \
+    --memory 24Gi \
+    --cpu 8 \
+    --no-cpu-throttling \
+    --port 11434
+```
+
+#### 方案 B：GCE GPU VM + vLLM（高效能生產）
+
+```
+┌─────────────────────────────────────────────────┐
+│         GCE VM (GPU: A100 / L4)                 │
+│                                                  │
+│  ┌─────────────────────────────────────────────┐│
+│  │ Docker Compose                               ││
+│  │                                              ││
+│  │  ┌──────────┐     ┌──────────────────────┐  ││
+│  │  │ CrewAI   │────▶│ vLLM Server          │  ││
+│  │  │ FastAPI  │     │ Llama 3.3 70B (AWQ)  │  ││
+│  │  │ :8080    │     │ OpenAI API :8000     │  ││
+│  │  └──────────┘     └──────────────────────┘  ││
+│  │                          │                   ││
+│  │                    ┌─────▼─────┐             ││
+│  │                    │ NVIDIA    │             ││
+│  │                    │ A100 80GB │             ││
+│  │                    └───────────┘             ││
+│  └─────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────┘
+```
+
+```yaml
+# docker-compose.yml
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    runtime: nvidia
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    command: >
+      --model meta-llama/Llama-3.3-70B-Instruct
+      --quantization awq
+      --max-model-len 8192
+      --gpu-memory-utilization 0.9
+      --tensor-parallel-size 1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  crewai:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_API_KEY=token-not-needed
+      - OPENAI_API_BASE=http://vllm:8000/v1
+    depends_on:
+      - vllm
+```
+
+```bash
+# GCE GPU VM 部署指令
+# 1. 建立 GPU VM
+gcloud compute instances create crewai-vllm-server \
+    --zone=us-central1-a \
+    --machine-type=a2-highgpu-1g \
+    --accelerator=type=nvidia-tesla-a100,count=1 \
+    --boot-disk-size=200GB \
+    --image-family=common-gpu \
+    --image-project=deeplearning-platform-release \
+    --maintenance-policy=TERMINATE
+
+# 2. SSH 進入並啟動
+gcloud compute ssh crewai-vllm-server --zone=us-central1-a
+
+# 3. 安裝 Docker + NVIDIA Container Toolkit
+sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2
+distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
+    sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+
+# 4. 啟動服務
+docker compose up -d
+```
+
+#### 方案 C：GKE + vLLM（大規模生產）
+
+```yaml
+# k8s/vllm-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        args:
+        - "--model"
+        - "meta-llama/Llama-3.3-70B-Instruct"
+        - "--quantization"
+        - "awq"
+        - "--max-model-len"
+        - "8192"
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: "80Gi"
+          requests:
+            nvidia.com/gpu: 1
+            memory: "40Gi"
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-tesla-a100
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+  selector:
+    app: vllm
+```
+
+CrewAI 的 Agent 只需指向內部服務：
+
+```python
+llm = LLM(
+    model="openai/meta-llama/Llama-3.3-70B-Instruct",
+    base_url="http://vllm-service:8000/v1",
+    api_key="not-needed",
+)
+```
+
+### 11.6 GCP GPU 定價與成本對比
+
+| GPU 型號 | 按需費用/小時 | 月費（24/7） | 適合模型 |
+|---------|-------------|-------------|---------|
+| **NVIDIA T4** (16 GB) | ~$0.35 | ~$252 | 7-8B 模型 |
+| **NVIDIA L4** (24 GB) | ~$0.70 | ~$504 | 8-24B 模型 |
+| **NVIDIA A100** (40 GB) | ~$3.00 | ~$2,160 | 70B 量化模型 |
+| **NVIDIA A100** (80 GB) | ~$4.00 | ~$2,880 | 70B 完整模型 |
+| **NVIDIA H100** (80 GB) | ~$11.00 | ~$7,920 | 大型模型、高吞吐量 |
+
+> Spot/搶佔式 VM 可降價 60-91%。A100 Spot 約 $1.0-1.5/hr，T4 Spot 約 $0.11/hr。
+
+### 11.7 成本損益分析
+
+**場景：每天 500 次 Crew 執行（每次約 5,000 token input + 2,000 token output）**
+
+| 方案 | 月費 | 年費 |
+|------|------|------|
+| **GPT-4o API** | ~$1,500-2,500 | ~$18,000-30,000 |
+| **Claude Sonnet API** | ~$1,200-2,000 | ~$14,400-24,000 |
+| **A100 自架 Llama 70B** | ~$2,160（固定） | ~$25,920 |
+| **A100 Spot 自架** | ~$720-1,080 | ~$8,640-12,960 |
+| **L4 自架 Llama 8B** | ~$504（固定） | ~$6,048 |
+| **L4 Spot 自架** | ~$150-250 | ~$1,800-3,000 |
+
+**損益轉折點**：
+
+- **低用量（<$500/月 API）**：用商用 API 更划算，不值得自架
+- **中用量（$500-2,000/月 API）**：自架開始有優勢，特別是用 Spot VM
+- **高用量（>$2,000/月 API）**：自架幾乎必然更便宜，且無 rate limit
+
+### 11.8 混合策略（推薦）
+
+**最佳實踐：不需要全部替換，用混合模型策略：**
+
+```python
+from crewai import Agent, LLM
+
+# 簡單任務用小型開源模型（成本極低）
+simple_llm = LLM(model="ollama/llama3.2:8b", base_url="http://ollama:11434")
+
+# 複雜推理用大型開源模型
+reasoning_llm = LLM(
+    model="openai/meta-llama/Llama-3.3-70B-Instruct",
+    base_url="http://vllm:8000/v1",
+    api_key="not-needed",
+)
+
+# 最高品質輸出用商用模型
+premium_llm = LLM(model="gpt-4o")
+
+# 分配策略
+researcher = Agent(role="Researcher", llm=simple_llm, ...)      # 大量搜尋：用便宜模型
+analyst = Agent(role="Analyst", llm=reasoning_llm, ...)          # 分析推理：用中等模型
+writer = Agent(role="Writer", llm=premium_llm, ...)              # 最終輸出：用頂級模型
+```
+
+這種混合策略可以在保持輸出品質的同時，**降低 60-80% 的 LLM 成本**。
+
+### 11.9 注意事項
+
+| 項目 | 說明 |
+|------|------|
+| **Tool Calling** | 並非所有開源模型都支援 function calling，建議用 Llama 3.3、Mistral、Qwen 2.5 等有完整工具支援的模型 |
+| **冷啟動** | GPU VM 需要 1-5 分鐘載入模型，建議保持常駐或用 Spot 搶佔式策略 |
+| **品質差異** | 8B 模型在複雜推理上顯著弱於 GPT-4o，建議先測試 |
+| **繁中支援** | Qwen 2.5 對繁體中文支援最佳；Llama 3.3 次之 |
+| **量化損失** | 4-bit 量化在簡單任務上品質損失 <5%，複雜推理可能 10-15% |
+| **維運成本** | 自架需要人力維護 GPU 驅動、模型更新、監控 |
+
+---
+
 ## 參考來源
 
 - [CrewAI GitHub Repository](https://github.com/crewAIInc/crewAI)
@@ -813,3 +1179,12 @@ CrewAI 已原生支援 A2A（`crewai[a2a]` 套件），可以：
 - [Unlocking Multi-Agent A2A on Google Cloud - Google Dev](https://discuss.google.dev/t/unlocking-multi-agent-a2a-how-to-connect-crewai-and-adk-on-google-cloud/265858)
 - [Quickstart: Deploy FastAPI to Cloud Run - Google Cloud](https://docs.google.com/run/docs/quickstarts/build-and-deploy/deploy-python-fastapi-service)
 - [KAgent: Deploying Custom AI Agents from CrewAI](https://kagent.dev/blog/crewai-byo-agent)
+- [CrewAI LLM Connections 官方文件](https://docs.crewai.com/en/learn/llm-connections)
+- [Self-Hosted LLM Guide: Setup, Tools & Cost Comparison (2026)](https://blog.premai.io/self-hosted-llm-guide-setup-tools-cost-comparison-2026/)
+- [Ollama vs llama.cpp vs vLLM: 2026 Comparison](https://www.decodesfuture.com/articles/llama-cpp-vs-ollama-vs-vllm-local-llm-stack-guide)
+- [vLLM vs Ollama - Northflank](https://northflank.com/blog/vllm-vs-ollama-and-how-to-run-them)
+- [Run LLM on Cloud Run GPUs with Ollama - Google Cloud](https://docs.cloud.google.com/run/docs/tutorials/gpu-gemma-with-ollama)
+- [GCP GPU Pricing](https://cloud.google.com/compute/gpus-pricing)
+- [Cloud GPU Pricing Comparison 2026 - Nerd Level Tech](https://nerdleveltech.com/cloud-gpu-pricing-comparison-2026-aws-vs-gcp-vs-azure-for-ai-training)
+- [Guide to Local LLMs in 2026 - SitePoint](https://www.sitepoint.com/definitive-guide-local-llms-2026-privacy-tools-hardware/)
+- [Best Open Source LLMs 2026 - Contabo](https://contabo.com/blog/open-source-llms/)
